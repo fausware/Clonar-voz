@@ -1,0 +1,29 @@
+# ---- Pesos del modelo -------------------------------------------------------
+# Son 1,5 GB y se descargan en la instalación con descargar_modelo.py
+modelo/*.gguf
+modelo/*.parte
+
+# ---- Datos del usuario ------------------------------------------------------
+voces/
+salidas/
+config.json
+.tmp/
+
+# ---- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# ---- Sistema ----------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+
+# ---- Audio suelto en la raíz ------------------------------------------------
+/*.wav
+/*.mp3
