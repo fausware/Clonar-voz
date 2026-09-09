@@ -67,6 +67,11 @@ no sirven.
 ```bash
 winget install ggml.llamacpp
 ```
+En el caso de que no dé el comando anterior entonces usar
+
+```bash
+winget install --id ggml.llamacpp --source winget
+```
 
 **macOS**
 
