@@ -8,10 +8,12 @@ el modo se elige en cada petición mediante -ngl / --device / -mmdev.
 
 Uso:  python app.py            ->  http://127.0.0.1:8080
 """
+
 from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import queue
 import re
@@ -26,6 +28,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import anyio
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
@@ -43,6 +46,10 @@ ARCHIVO_CONFIG = BASE / "config.json"
 
 for _d in (DIR_VOCES, DIR_SALIDAS, DIR_TMP, DIR_ESTATICO):
     _d.mkdir(exist_ok=True)
+    try:
+        _d.chmod(0o700)
+    except OSError:
+        pass
 
 SIN_VENTANA = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -50,7 +57,13 @@ SIN_VENTANA = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # consumo de VRAM y agotan las gráficas de 8 GB.
 CERROJO_SINTESIS = threading.Lock()
 
-MAX_BYTES_REFERENCIA = 60 * 1024 * 1024   # 60 MB de audio de referencia
+MAX_BYTES_REFERENCIA = 60 * 1024 * 1024  # 60 MB de audio de referencia
+MAX_CARACTERES_TEXTO = 20_000
+MAX_BYTES_SALIDAS = 1024 * 1024 * 1024  # 1 GiB
+RETENCION_SALIDAS_SEGUNDOS = 30 * 24 * 60 * 60
+TAMANO_CHUNK_SUBIDA = 1024 * 1024
+SUFIJOS_AUDIO = {".wav", ".mp3", ".m4a", ".mp4", ".ogg", ".flac", ".webm"}
+MIMES_APLICACION_AUDIO = {"application/ogg", "application/octet-stream"}
 
 # Idiomas admitidos por --tts-lang (ISO 639-1)
 IDIOMAS = {
@@ -67,39 +80,126 @@ IDIOMAS = {
 }
 
 CONFIG_POR_DEFECTO: dict[str, Any] = {
-    "binario": "",           # ruta a llama-tts.exe ("" = autodetección)
-    "modelo": "",            # ruta al .gguf principal ("" = autodetección en ./modelo)
-    "mmproj": "",            # ruta al mmproj .gguf
-    "dispositivo": "auto",   # auto | cpu | <id de dispositivo, p.ej. Vulkan1>
+    "binario": "",  # ruta a llama-tts.exe ("" = autodetección)
+    "modelo": "",  # ruta al .gguf principal ("" = autodetección en ./modelo)
+    "mmproj": "",  # ruta al mmproj .gguf
+    "dispositivo": "auto",  # auto | cpu | <id de dispositivo, p.ej. Vulkan1>
     "capas_gpu": 99,
-    "hilos": 0,              # 0 = automático
+    "hilos": 0,  # 0 = automático
     "idioma": "es",
     "top_k": 40,
     "top_p": 0.95,
     "temp": 0.8,
-    "semilla": -1,           # -1 = aleatoria
-    "max_frames": 1200,      # -n : el modelo genera 12 frames por segundo de audio
+    "semilla": -1,  # -1 = aleatoria
+    "max_frames": 1200,  # -n : el modelo genera 12 frames por segundo de audio
     "chars_por_bloque": 280,
-    "pausa_ms": 150,         # silencio insertado entre bloques
+    "pausa_ms": 150,  # silencio insertado entre bloques
 }
+
+AJUSTES_EDITABLES = frozenset(CONFIG_POR_DEFECTO) - {"binario", "modelo", "mmproj"}
+LIMITES_NUMERICOS: dict[str, tuple[type[int] | type[float], float, float]] = {
+    "capas_gpu": (int, 0, 999),
+    "hilos": (int, 0, 128),
+    "top_k": (int, 0, 200),
+    "top_p": (float, 0.1, 1.0),
+    "temp": (float, 0.1, 1.5),
+    "semilla": (int, -1, 2_147_483_647),
+    "max_frames": (int, 120, 6000),
+    "chars_por_bloque": (int, 80, 600),
+    "pausa_ms": (int, 0, 2000),
+}
+
+
+def validar_numero(clave: str, valor: Any) -> int | float:
+    tipo, minimo, maximo = LIMITES_NUMERICOS[clave]
+    if isinstance(valor, bool) or not isinstance(valor, (int, float)):
+        raise HTTPException(400, f"El ajuste '{clave}' debe ser numérico.")
+    numero = float(valor)
+    if not math.isfinite(numero) or not minimo <= numero <= maximo:
+        raise HTTPException(
+            400, f"El ajuste '{clave}' debe estar entre {minimo:g} y {maximo:g}."
+        )
+    if tipo is int:
+        if not numero.is_integer():
+            raise HTTPException(400, f"El ajuste '{clave}' debe ser un entero.")
+        return int(numero)
+    return numero
+
+
+def validar_dispositivo(valor: Any) -> str:
+    dispositivo = str(valor)
+    if dispositivo not in ("auto", "cpu") and not re.fullmatch(
+        r"[A-Za-z][A-Za-z0-9_.:-]{0,63}", dispositivo
+    ):
+        raise HTTPException(400, "Identificador de dispositivo no válido.")
+    return dispositivo
+
+
+def validar_ajustes(datos: dict[str, Any]) -> dict[str, Any]:
+    """Valida los ajustes que pueden llegar desde la API."""
+    desconocidos = set(datos) - AJUSTES_EDITABLES
+    if desconocidos:
+        raise HTTPException(
+            400, f"Ajustes no permitidos: {', '.join(sorted(desconocidos))}"
+        )
+
+    resultado: dict[str, Any] = {}
+    for clave, valor in datos.items():
+        if clave in LIMITES_NUMERICOS:
+            resultado[clave] = validar_numero(clave, valor)
+        elif clave == "idioma":
+            if valor not in IDIOMAS:
+                raise HTTPException(400, "Idioma no admitido.")
+            resultado[clave] = valor
+        elif clave == "dispositivo":
+            resultado[clave] = validar_dispositivo(valor)
+    return resultado
 
 
 # ---------------------------------------------------------------------------
 # Configuración
 # ---------------------------------------------------------------------------
+def aplicar_config_guardada(cfg: dict[str, Any], guardada: dict[str, Any]) -> None:
+    for clave in ("binario", "modelo", "mmproj"):
+        if clave in guardada and isinstance(guardada[clave], str):
+            cfg[clave] = guardada[clave]
+    for clave in AJUSTES_EDITABLES & guardada.keys():
+        try:
+            cfg.update(validar_ajustes({clave: guardada[clave]}))
+        except HTTPException:
+            pass
+
+
 def cargar_config() -> dict[str, Any]:
     cfg = dict(CONFIG_POR_DEFECTO)
     if ARCHIVO_CONFIG.exists():
         try:
             guardada = json.loads(ARCHIVO_CONFIG.read_text("utf-8"))
-            cfg.update({k: v for k, v in guardada.items() if k in CONFIG_POR_DEFECTO})
-        except (OSError, ValueError):
+            if isinstance(guardada, dict):
+                aplicar_config_guardada(cfg, guardada)
+        except (OSError, ValueError, TypeError):
             pass
     return cfg
 
 
 def guardar_config(cfg: dict[str, Any]) -> None:
     ARCHIVO_CONFIG.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), "utf-8")
+    proteger_archivo(ARCHIVO_CONFIG)
+
+
+def proteger_archivo(ruta: Path) -> None:
+    """Restringe el archivo al usuario actual en sistemas POSIX."""
+    try:
+        ruta.chmod(0o600)
+    except OSError:
+        pass
+
+
+def proteger_directorio(ruta: Path) -> None:
+    try:
+        ruta.chmod(0o700)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +214,8 @@ def buscar_binario() -> str:
     local = Path(os.environ.get("LOCALAPPDATA", ""))
     candidatos = [
         # Windows (winget)
-        local / "Microsoft/WinGet/Packages"
+        local
+        / "Microsoft/WinGet/Packages"
         / "ggml.llamacpp_Microsoft.Winget.Source_8wekyb3d8bbwe/llama-tts.exe",
         BASE / "llamacpp" / "llama-tts.exe",
         BASE / "llama.cpp" / "llama-tts.exe",
@@ -160,8 +261,13 @@ def rutas_efectivas(cfg: dict[str, Any]) -> tuple[str, str, str]:
 def _ejecutar(cmd: list[str], timeout: int = 30) -> str:
     try:
         r = subprocess.run(
-            cmd, capture_output=True, timeout=timeout, text=True,
-            encoding="utf-8", errors="replace", creationflags=SIN_VENTANA,
+            cmd,
+            capture_output=True,
+            timeout=timeout,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=SIN_VENTANA,
         )
         return (r.stdout or "") + (r.stderr or "")
     except (OSError, subprocess.SubprocessError):
@@ -185,12 +291,14 @@ def listar_dispositivos(binario: str) -> list[dict[str, Any]]:
     for linea in _ejecutar([binario, "--list-devices"]).splitlines():
         m = patron.match(linea)
         if m:
-            dispositivos.append({
-                "id": m.group(1),
-                "nombre": m.group(2).strip(),
-                "memoria_mb": int(m.group(3)),
-                "libre_mb": int(m.group(4)),
-            })
+            dispositivos.append(
+                {
+                    "id": m.group(1),
+                    "nombre": m.group(2).strip(),
+                    "memoria_mb": int(m.group(3)),
+                    "libre_mb": int(m.group(4)),
+                }
+            )
     _cache[binario] = dispositivos
     return dispositivos
 
@@ -213,8 +321,9 @@ def version_binario(binario: str) -> str:
         return ""
     clave = f"version::{binario}"
     if clave not in _cache:
-        m = re.search(r"version:\s*(\S+.*)",
-                      _ejecutar([binario, "--version"], timeout=20))
+        m = re.search(
+            r"version:\s*(\S+.*)", _ejecutar([binario, "--version"], timeout=20)
+        )
         _cache[clave] = m.group(1).strip() if m else ""
     return _cache[clave]
 
@@ -239,20 +348,82 @@ def hay_ffmpeg() -> bool:
 def convertir_a_wav(origen: Path, destino: Path, hz: int = 16000) -> None:
     """Normaliza cualquier audio a WAV PCM mono, que es lo que espera el modelo."""
     if not hay_ffmpeg():
-        if origen.suffix.lower() in (".wav", ".mp3"):
-            shutil.copyfile(origen, destino)
-            return
-        raise HTTPException(500, "Se necesita ffmpeg para convertir este formato de audio.")
+        if origen.suffix.lower() != ".wav":
+            raise HTTPException(
+                400, "Se necesita ffmpeg para convertir este formato de audio."
+            )
+        try:
+            with wave.open(str(origen), "rb") as wav:
+                compatible = (
+                    wav.getnchannels() == 1
+                    and wav.getsampwidth() == 2
+                    and wav.getframerate() == hz
+                    and wav.getcomptype() == "NONE"
+                )
+        except (OSError, wave.Error) as exc:
+            raise HTTPException(400, "El archivo no es un WAV válido.") from exc
+        if not compatible:
+            raise HTTPException(
+                400, "Sin ffmpeg, el WAV debe ser PCM mono de 16 bits a 16 kHz."
+            )
+        shutil.copyfile(origen, destino)
+        proteger_archivo(destino)
+        return
 
-    r = subprocess.run(
-        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-         "-i", str(origen), "-ac", "1", "-ar", str(hz),
-         "-c:a", "pcm_s16le", str(destino)],
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-        creationflags=SIN_VENTANA,
-    )
+    try:
+        r = subprocess.run(
+            [
+                "ffmpeg",
+                "-nostdin",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-protocol_whitelist",
+                "file,pipe",
+                "-i",
+                str(origen),
+                "-vn",
+                "-ac",
+                "1",
+                "-ar",
+                str(hz),
+                "-c:a",
+                "pcm_s16le",
+                str(destino),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=SIN_VENTANA,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired as exc:
+        destino.unlink(missing_ok=True)
+        raise HTTPException(
+            400, "ffmpeg tardó demasiado en procesar el audio."
+        ) from exc
     if r.returncode != 0 or not destino.exists():
-        raise HTTPException(500, f"ffmpeg no pudo convertir el audio: {r.stderr[:400]}")
+        destino.unlink(missing_ok=True)
+        raise HTTPException(400, f"ffmpeg no pudo convertir el audio: {r.stderr[:400]}")
+    proteger_archivo(destino)
+
+
+async def guardar_subida_limitada(audio: UploadFile, destino: Path) -> None:
+    """Escribe una subida sin cargarla completa en memoria."""
+    total = 0
+    async with await anyio.open_file(destino, "xb") as archivo:
+        while bloque := await audio.read(TAMANO_CHUNK_SUBIDA):
+            total += len(bloque)
+            if total > MAX_BYTES_REFERENCIA:
+                raise HTTPException(
+                    413,
+                    "El audio de referencia no puede pasar de 60 MB. "
+                    "Con 10-15 segundos de voz es más que suficiente.",
+                )
+            await archivo.write(bloque)
+    proteger_archivo(destino)
 
 
 def duracion_wav(ruta: Path) -> float:
@@ -276,7 +447,8 @@ def unir_wavs(partes: list[Path], destino: Path, pausa_ms: int = 150) -> None:
         parametros = w0.getparams()
     silencio = b"\x00" * (
         int(parametros.framerate * pausa_ms / 1000)
-        * parametros.nchannels * parametros.sampwidth
+        * parametros.nchannels
+        * parametros.sampwidth
     )
     with wave.open(str(destino), "wb") as salida:
         salida.setparams(parametros)
@@ -285,6 +457,33 @@ def unir_wavs(partes: list[Path], destino: Path, pausa_ms: int = 150) -> None:
                 salida.writeframes(w.readframes(w.getnframes()))
             if i < len(partes) - 1 and silencio:
                 salida.writeframes(silencio)
+    proteger_archivo(destino)
+
+
+def limpiar_salidas() -> None:
+    """Conserva como máximo 30 días de resultados y 1 GiB total."""
+    ahora = time.time()
+    archivos = sorted(
+        DIR_SALIDAS.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    vigentes: list[Path] = []
+    for archivo in archivos:
+        try:
+            if ahora - archivo.stat().st_mtime > RETENCION_SALIDAS_SEGUNDOS:
+                archivo.unlink(missing_ok=True)
+            else:
+                vigentes.append(archivo)
+        except OSError:
+            continue
+
+    acumulado = 0
+    for archivo in vigentes:
+        try:
+            acumulado += archivo.stat().st_size
+            if acumulado > MAX_BYTES_SALIDAS:
+                archivo.unlink(missing_ok=True)
+        except OSError:
+            continue
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +538,9 @@ def meta_voz(carpeta: Path) -> dict[str, Any] | None:
 
 def listar_voces() -> list[dict[str, Any]]:
     voces = [meta_voz(c) for c in DIR_VOCES.iterdir() if c.is_dir()]
-    return sorted((v for v in voces if v), key=lambda v: v.get("creada", ""), reverse=True)
+    return sorted(
+        (v for v in voces if v), key=lambda v: v.get("creada", ""), reverse=True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -372,27 +573,42 @@ def podar_tareas(vida_segundos: int = 900) -> None:
             TAREAS.pop(id_, None)
 
 
-def construir_comando(cfg: dict[str, Any], texto: str, salida: Path,
-                      ref: Path | None, dispositivo: str) -> list[str]:
+def construir_comando(
+    cfg: dict[str, Any], texto: str, salida: Path, ref: Path | None, dispositivo: str
+) -> list[str]:
     """`dispositivo` vacío = CPU pura; en otro caso, el id que reporta llama.cpp."""
     binario, modelo, mmproj = rutas_efectivas(cfg)
     cmd = [
         binario,
-        "-m", modelo,
-        "-mm", mmproj,
-        "-p", texto,
-        "-o", str(salida),
-        "--tts-lang", str(cfg["idioma"]),
-        "-n", str(int(cfg["max_frames"])),
-        "--top-k", str(int(cfg["top_k"])),
-        "--top-p", str(float(cfg["top_p"])),
-        "--temp", str(float(cfg["temp"])),
+        "-m",
+        modelo,
+        "-mm",
+        mmproj,
+        "-p",
+        texto,
+        "-o",
+        str(salida),
+        "--tts-lang",
+        str(cfg["idioma"]),
+        "-n",
+        str(int(cfg["max_frames"])),
+        "--top-k",
+        str(int(cfg["top_k"])),
+        "--top-p",
+        str(float(cfg["top_p"])),
+        "--temp",
+        str(float(cfg["temp"])),
     ]
     if dispositivo:
         # -mmdev es decisivo: sin él el vocoder corre en CPU y tarda ~15x más.
-        cmd += ["-ngl", str(int(cfg["capas_gpu"])),
-                "--device", dispositivo,
-                "-mmdev", dispositivo]
+        cmd += [
+            "-ngl",
+            str(int(cfg["capas_gpu"])),
+            "--device",
+            dispositivo,
+            "-mmdev",
+            dispositivo,
+        ]
     else:
         cmd += ["-ngl", "0", "--device", "none", "--no-mmproj-offload"]
     if int(cfg.get("hilos") or 0) > 0:
@@ -404,8 +620,14 @@ def construir_comando(cfg: dict[str, Any], texto: str, salida: Path,
     return cmd
 
 
-def ejecutar_sintesis(tarea: Tarea, cfg: dict[str, Any], bloques: list[str],
-                      ref: Path | None, dispositivo: str, destino: Path) -> None:
+def ejecutar_sintesis(
+    tarea: Tarea,
+    cfg: dict[str, Any],
+    bloques: list[str],
+    ref: Path | None,
+    dispositivo: str,
+    destino: Path,
+) -> None:
     """Hilo de trabajo: sintetiza bloque a bloque y une los resultados."""
     partes: list[Path] = []
     inicio = time.time()
@@ -417,12 +639,18 @@ def ejecutar_sintesis(tarea: Tarea, cfg: dict[str, Any], bloques: list[str],
             if tarea.cancelada:
                 break
             parcial = DIR_TMP / f"{tarea.id}_{i:03d}.wav"
+            partes.append(parcial)
             tarea.emitir("bloque", indice=i, total=len(bloques), texto=bloque)
 
             cmd = construir_comando(cfg, bloque, parcial, ref, dispositivo)
             tarea.proceso = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace", bufsize=1,
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
                 creationflags=SIN_VENTANA,
             )
             assert tarea.proceso.stdout is not None
@@ -436,8 +664,9 @@ def ejecutar_sintesis(tarea: Tarea, cfg: dict[str, Any], bloques: list[str],
             if tarea.cancelada:
                 break
             if codigo != 0 or not parcial.exists():
-                raise RuntimeError(f"llama-tts terminó con código {codigo} en el bloque {i}.")
-            partes.append(parcial)
+                raise RuntimeError(
+                    f"llama-tts terminó con código {codigo} en el bloque {i}."
+                )
 
         if tarea.cancelada:
             tarea.estado = "cancelada"
@@ -445,11 +674,17 @@ def ejecutar_sintesis(tarea: Tarea, cfg: dict[str, Any], bloques: list[str],
             return
 
         unir_wavs(partes, destino, int(cfg["pausa_ms"]))
+        proteger_archivo(destino)
+        limpiar_salidas()
         tarea.estado = "terminada"
-        tarea.emitir("fin", archivo=destino.name,
-                     duracion=round(duracion_wav(destino), 2),
-                     segundos=round(time.time() - inicio, 1))
+        tarea.emitir(
+            "fin",
+            archivo=destino.name,
+            duracion=round(duracion_wav(destino), 2),
+            segundos=round(time.time() - inicio, 1),
+        )
     except Exception as exc:  # noqa: BLE001 — el mensaje se muestra íntegro en la web
+        destino.unlink(missing_ok=True)
         tarea.estado = "error"
         tarea.emitir("error", mensaje=str(exc))
     finally:
@@ -476,37 +711,37 @@ def estado() -> dict[str, Any]:
     binario, modelo, mmproj = rutas_efectivas(cfg)
     dispositivos = listar_dispositivos(binario)
     return {
-        "binario": binario,
+        "binario": Path(binario).name if binario else "",
         "binario_ok": bool(binario and Path(binario).is_file()),
         "version": version_binario(binario),
         "soporta_qwen3tts": soporta_qwen3tts(binario),
-        "modelo": modelo,
+        "modelo": Path(modelo).name if modelo else "",
         "modelo_ok": bool(modelo and Path(modelo).is_file()),
-        "mmproj": mmproj,
+        "mmproj": Path(mmproj).name if mmproj else "",
         "mmproj_ok": bool(mmproj and Path(mmproj).is_file()),
         "dispositivos": dispositivos,
         "dispositivo_preferido": dispositivo_preferido(binario),
         "ffmpeg": hay_ffmpeg(),
         "idiomas": IDIOMAS,
         "cpus": os.cpu_count() or 4,
-        "config": cfg,
+        "config": {k: v for k, v in cfg.items() if k in AJUSTES_EDITABLES},
     }
 
 
 @app.get("/api/config")
 def obtener_config() -> dict[str, Any]:
-    return cargar_config()
+    cfg = cargar_config()
+    return {k: v for k, v in cfg.items() if k in AJUSTES_EDITABLES}
 
 
 @app.post("/api/config")
 async def actualizar_config(datos: dict[str, Any]) -> dict[str, Any]:
     cfg = cargar_config()
-    for clave, valor in datos.items():
-        if clave in CONFIG_POR_DEFECTO:
-            cfg[clave] = valor
+    cfg.update(validar_ajustes(datos))
+    validar_ajustes({k: cfg[k] for k in AJUSTES_EDITABLES})
     guardar_config(cfg)
     _cache.clear()
-    return cfg
+    return {k: v for k, v in cfg.items() if k in AJUSTES_EDITABLES}
 
 
 # ---------------------------------------------------------------------------
@@ -526,12 +761,21 @@ class DescargaModelo:
         self.velocidad = 0.0
 
     def progreso(self, archivo: str, hecho: int, total: int, velocidad: float) -> None:
-        self.archivo, self.hecho, self.total, self.velocidad = archivo, hecho, total, velocidad
+        self.archivo, self.hecho, self.total, self.velocidad = (
+            archivo,
+            hecho,
+            total,
+            velocidad,
+        )
 
     def instantanea(self) -> dict[str, Any]:
         return {
-            "activa": self.activa, "terminada": self.terminada, "error": self.error,
-            "archivo": self.archivo, "hecho": self.hecho, "total": self.total,
+            "activa": self.activa,
+            "terminada": self.terminada,
+            "error": self.error,
+            "archivo": self.archivo,
+            "hecho": self.hecho,
+            "total": self.total,
             "velocidad": round(self.velocidad),
         }
 
@@ -557,8 +801,10 @@ def iniciar_descarga(datos: dict[str, Any]) -> dict[str, Any]:
 
     clave_modelo = str(datos.get("modelo") or descargar_modelo.POR_DEFECTO["modelo"])
     clave_mmproj = str(datos.get("mmproj") or descargar_modelo.POR_DEFECTO["mmproj"])
-    if (clave_modelo not in descargar_modelo.CATALOGO["modelo"]
-            or clave_mmproj not in descargar_modelo.CATALOGO["mmproj"]):
+    if (
+        clave_modelo not in descargar_modelo.CATALOGO["modelo"]
+        or clave_mmproj not in descargar_modelo.CATALOGO["mmproj"]
+    ):
         raise HTTPException(400, "Cuantización desconocida.")
 
     DESCARGA.__init__()  # reinicia el estado
@@ -567,8 +813,13 @@ def iniciar_descarga(datos: dict[str, Any]) -> dict[str, Any]:
     def trabajo() -> None:
         try:
             descargar_modelo.descargar_todo(
-                clave_modelo, clave_mmproj, DIR_MODELO, DESCARGA.progreso,
-                verificar=True, cancelado=lambda: DESCARGA.cancelada)
+                clave_modelo,
+                clave_mmproj,
+                DIR_MODELO,
+                DESCARGA.progreso,
+                verificar=True,
+                cancelado=lambda: DESCARGA.cancelada,
+            )
             DESCARGA.terminada = True
             _cache.clear()
         except Exception as exc:  # noqa: BLE001 — se enseña tal cual en la web
@@ -595,9 +846,11 @@ async def progreso_descarga() -> StreamingResponse:
                 return
             await asyncio.sleep(0.4)
 
-    return StreamingResponse(flujo(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache",
-                                      "X-Accel-Buffering": "no"})
+    return StreamingResponse(
+        flujo(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/api/voces")
@@ -606,31 +859,59 @@ def api_listar_voces() -> list[dict[str, Any]]:
 
 
 @app.post("/api/voces")
-async def crear_voz(audio: UploadFile = File(...), nombre: str = Form(...),
-                    transcripcion: str = Form("")) -> dict[str, Any]:
+async def crear_voz(
+    audio: UploadFile = File(...),
+    nombre: str = Form(...),
+    transcripcion: str = Form(""),
+) -> dict[str, Any]:
+    nombre = nombre.strip()
+    transcripcion = transcripcion.strip()
+    if len(nombre) > 60 or len(transcripcion) > 300:
+        raise HTTPException(
+            400, "El nombre o la transcripción superan el límite permitido."
+        )
+
+    sufijo = Path(audio.filename or "audio.webm").suffix.lower() or ".webm"
+    if sufijo not in SUFIJOS_AUDIO:
+        raise HTTPException(415, "Formato de audio no admitido.")
+    mime = (audio.content_type or "application/octet-stream").lower()
+    if not (
+        mime.startswith("audio/")
+        or mime.startswith("video/")
+        or mime in MIMES_APLICACION_AUDIO
+    ):
+        raise HTTPException(415, "El tipo MIME del archivo no corresponde a audio.")
+
     id_voz = uuid.uuid4().hex[:12]
     carpeta = DIR_VOCES / id_voz
-    carpeta.mkdir(parents=True)
+    carpeta.mkdir(parents=True, mode=0o700)
+    proteger_directorio(carpeta)
 
-    sufijo = Path(audio.filename or "audio.webm").suffix or ".webm"
     bruto = carpeta / f"original{sufijo}"
     try:
-        datos_audio = await audio.read()
-        if len(datos_audio) > MAX_BYTES_REFERENCIA:
-            raise HTTPException(413, "El audio de referencia no puede pasar de 60 MB. "
-                                     "Con 10-15 segundos de voz es más que suficiente.")
-        bruto.write_bytes(datos_audio)
+        await guardar_subida_limitada(audio, bruto)
         convertir_a_wav(bruto, carpeta / "referencia.wav")
     except Exception:
         shutil.rmtree(carpeta, ignore_errors=True)
         raise
+    finally:
+        await audio.close()
     bruto.unlink(missing_ok=True)
 
-    (carpeta / "voz.json").write_text(json.dumps({
-        "nombre": nombre.strip() or "Voz sin nombre",
-        "transcripcion": transcripcion.strip(),
-        "creada": datetime.now().isoformat(timespec="seconds"),
-    }, indent=2, ensure_ascii=False), "utf-8")
+    ruta_meta = carpeta / "voz.json"
+    ruta_meta.write_text(
+        json.dumps(
+            {
+                "nombre": nombre or "Voz sin nombre",
+                "transcripcion": transcripcion,
+                "creada": datetime.now().isoformat(timespec="seconds"),
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        "utf-8",
+    )
+    proteger_archivo(ruta_meta)
     return meta_voz(carpeta) or {}
 
 
@@ -654,23 +935,37 @@ def audio_voz(id_voz: str) -> FileResponse:
 @app.post("/api/generar")
 async def generar(datos: dict[str, Any]) -> dict[str, Any]:
     cfg = cargar_config()
-    for clave in ("idioma", "top_k", "top_p", "temp", "semilla", "max_frames",
-                  "chars_por_bloque", "pausa_ms", "capas_gpu", "hilos"):
-        if datos.get(clave) not in (None, ""):
-            cfg[clave] = datos[clave]
+    ajustes = {
+        clave: datos[clave]
+        for clave in AJUSTES_EDITABLES
+        if datos.get(clave) not in (None, "")
+    }
+    cfg.update(validar_ajustes(ajustes))
 
     binario, modelo, mmproj = rutas_efectivas(cfg)
-    for ruta, etiqueta in ((binario, "binario llama-tts"), (modelo, "modelo"),
-                           (mmproj, "mmproj")):
+    for ruta, etiqueta in (
+        (binario, "binario llama-tts"),
+        (modelo, "modelo"),
+        (mmproj, "mmproj"),
+    ):
         if not ruta or not Path(ruta).is_file():
-            raise HTTPException(400, f"No se encuentra el {etiqueta}. Revisa los ajustes.")
+            raise HTTPException(
+                400, f"No se encuentra el {etiqueta}. Revisa los ajustes."
+            )
     if not soporta_qwen3tts(binario):
-        raise HTTPException(400, "Tu llama.cpp no admite Qwen3-TTS (falta --mmproj en "
-                                 "llama-tts). Actualízalo: winget upgrade ggml.llamacpp")
+        raise HTTPException(
+            400,
+            "Tu llama.cpp no admite Qwen3-TTS (falta --mmproj en "
+            "llama-tts). Actualízalo: winget upgrade ggml.llamacpp",
+        )
 
     texto = str(datos.get("texto", "")).strip()
     if not texto:
         raise HTTPException(400, "Escribe el texto que quieres sintetizar.")
+    if len(texto) > MAX_CARACTERES_TEXTO:
+        raise HTTPException(
+            413, f"El texto no puede superar {MAX_CARACTERES_TEXTO} caracteres."
+        )
 
     ref: Path | None = None
     if datos.get("voz"):
@@ -692,11 +987,18 @@ async def generar(datos: dict[str, Any]) -> dict[str, Any]:
 
     tarea = Tarea(id_tarea, len(bloques))
     TAREAS[id_tarea] = tarea
-    threading.Thread(target=ejecutar_sintesis, daemon=True,
-                     args=(tarea, cfg, bloques, ref, dispositivo, destino)).start()
+    threading.Thread(
+        target=ejecutar_sintesis,
+        daemon=True,
+        args=(tarea, cfg, bloques, ref, dispositivo, destino),
+    ).start()
 
-    return {"id": id_tarea, "bloques": len(bloques),
-            "dispositivo": dispositivo or "CPU", "archivo": destino.name}
+    return {
+        "id": id_tarea,
+        "bloques": len(bloques),
+        "dispositivo": dispositivo or "CPU",
+        "archivo": destino.name,
+    }
 
 
 @app.get("/api/tarea/{id_tarea}/eventos")
@@ -718,9 +1020,11 @@ async def eventos(id_tarea: str) -> StreamingResponse:
             if evento["tipo"] in ("fin", "error", "cancelada"):
                 return
 
-    return StreamingResponse(flujo(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache",
-                                      "X-Accel-Buffering": "no"})
+    return StreamingResponse(
+        flujo(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/api/tarea/{id_tarea}/cancelar")
@@ -736,14 +1040,21 @@ def cancelar(id_tarea: str) -> dict[str, bool]:
 
 @app.get("/api/salidas")
 def listar_salidas() -> list[dict[str, Any]]:
-    archivos = sorted(DIR_SALIDAS.glob("*.wav"),
-                      key=lambda p: p.stat().st_mtime, reverse=True)
-    return [{
-        "archivo": a.name,
-        "tamano": a.stat().st_size,
-        "duracion": round(duracion_wav(a), 2),
-        "fecha": datetime.fromtimestamp(a.stat().st_mtime).isoformat(timespec="seconds"),
-    } for a in archivos[:80]]
+    limpiar_salidas()
+    archivos = sorted(
+        DIR_SALIDAS.glob("*.wav"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
+    return [
+        {
+            "archivo": a.name,
+            "tamano": a.stat().st_size,
+            "duracion": round(duracion_wav(a), 2),
+            "fecha": datetime.fromtimestamp(a.stat().st_mtime).isoformat(
+                timespec="seconds"
+            ),
+        }
+        for a in archivos[:80]
+    ]
 
 
 @app.get("/api/salidas/{archivo}")

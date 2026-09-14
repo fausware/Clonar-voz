@@ -67,6 +67,7 @@ no sirven.
 ```bash
 winget install ggml.llamacpp
 ```
+
 En el caso de que no dé el comando anterior entonces usar
 
 ```bash
@@ -91,7 +92,8 @@ llama-tts --version
 ### Paso 3 — Instalar ffmpeg
 
 Convierte el audio de referencia al formato que espera el modelo. Sin él solo
-podrás subir `.wav` y `.mp3`, y la grabación desde el navegador no funcionará.
+podrás subir WAV PCM mono de 16 bits a 16 kHz; otros WAV, MP3 y la grabación
+desde el navegador necesitan conversión.
 
 ```bash
 winget install Gyan.FFmpeg
@@ -131,10 +133,10 @@ Si no lo hiciste en el paso anterior, la web te recibe con este panel:
 
 Elige la cuantización y pulsa **Descargar ahora**. Son dos archivos:
 
-| Archivo | Tamaño | Para qué |
-|---|---|---|
-| `Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf` | 1,04 GB | genera los tokens de audio |
-| `mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` | 446 MB | vocoder: convierte esos tokens en sonido |
+| Archivo                                     | Tamaño  | Para qué                                 |
+| ------------------------------------------- | ------- | ---------------------------------------- |
+| `Qwen3-TTS-12Hz-1.7B-Base-Q4_K_M.gguf`      | 1,04 GB | genera los tokens de audio               |
+| `mmproj-Qwen3-TTS-12Hz-1.7B-Base-Q8_0.gguf` | 446 MB  | vocoder: convierte esos tokens en sonido |
 
 **Hacen falta los dos.** La descarga es reanudable y verifica el SHA-256 al
 terminar. Desde la terminal es lo mismo:
@@ -175,7 +177,8 @@ Verás el progreso bloque a bloque y el registro de llama.cpp en directo:
 </p>
 
 El resultado aparece con reproductor y botón de descarga, y queda guardado en el
-historial.
+historial. Para evitar crecimiento ilimitado, se conservan como máximo 30 días
+y 1 GiB de audios; al superar el límite se eliminan primero los más antiguos.
 
 ---
 
@@ -183,11 +186,11 @@ historial.
 
 En el desplegable **Procesamiento**:
 
-| Opción | Cuándo usarla |
-|---|---|
-| **Automático** | por defecto: coge la mejor GPU detectada |
+| Opción           | Cuándo usarla                                        |
+| ---------------- | ---------------------------------------------------- |
+| **Automático**   | por defecto: coge la mejor GPU detectada             |
 | **GPU concreta** | si tienes varias; la marcada con ★ es la recomendada |
-| **Solo CPU** | equipos sin GPU, o si Vulkan/CUDA da problemas |
+| **Solo CPU**     | equipos sin GPU, o si Vulkan/CUDA da problemas       |
 
 La aplicación **prioriza la GPU dedicada sobre la integrada**. Es importante:
 llama.cpp por defecto suele coger la primera que encuentra, que en muchos
@@ -211,11 +214,11 @@ llama-tts ... -ngl 0 --device none --no-mmproj-offload
 
 Medido con la misma frase de ~4 segundos en un portátil con RTX 4070 (Vulkan):
 
-| Modo | Total | Vocoder |
-|---|---:|---:|
-| GPU **con** `-mmdev` | **1,9 s** | 0,14 s |
-| GPU sin `-mmdev` | 29,7 s | 23,6 s |
-| Solo CPU (16 hilos) | 4,7 s | 2,2 s |
+| Modo                 |     Total | Vocoder |
+| -------------------- | --------: | ------: |
+| GPU **con** `-mmdev` | **1,9 s** |  0,14 s |
+| GPU sin `-mmdev`     |    29,7 s |  23,6 s |
+| Solo CPU (16 hilos)  |     4,7 s |   2,2 s |
 
 Incluso en CPU pura es perfectamente usable.
 
@@ -227,15 +230,15 @@ Incluso en CPU pura es perfectamente usable.
   <img src="docs/capturas/03-ajustes.png" alt="Ajustes avanzados" width="100%">
 </p>
 
-| Ajuste | Qué hace |
-|---|---|
-| **Temperatura** | baja (0,6) = voz estable y fiel · alta (1,1) = más expresiva |
-| **Top-P / Top-K** | diversidad del muestreo |
-| **Semilla** | fíjala para reproducir exactamente la misma salida |
-| **Caracteres por bloque** | bloques cortos = más estable · largos = mejor entonación |
-| **Pausa entre bloques** | silencio insertado en las uniones |
-| **Máx. frames por bloque** | techo de audio por bloque (12 frames = 1 segundo) |
-| **Hilos de CPU** | 0 = automático |
+| Ajuste                     | Qué hace                                                     |
+| -------------------------- | ------------------------------------------------------------ |
+| **Temperatura**            | baja (0,6) = voz estable y fiel · alta (1,1) = más expresiva |
+| **Top-P / Top-K**          | diversidad del muestreo                                      |
+| **Semilla**                | fíjala para reproducir exactamente la misma salida           |
+| **Caracteres por bloque**  | bloques cortos = más estable · largos = mejor entonación     |
+| **Pausa entre bloques**    | silencio insertado en las uniones                            |
+| **Máx. frames por bloque** | techo de audio por bloque (12 frames = 1 segundo)            |
+| **Hilos de CPU**           | 0 = automático                                               |
 
 «Guardar como predeterminados» los escribe en `config.json`.
 
@@ -257,9 +260,9 @@ Clonar-voz/
 └── docs/capturas/         capturas del README
 ```
 
-`config.json` se crea al guardar ajustes. Acepta rutas manuales en `binario`,
-`modelo` y `mmproj` si quieres apuntar a otra instalación de llama.cpp o a otra
-cuantización. Vacío = autodetección.
+`config.json` se crea al guardar ajustes. La API valida los mismos límites que
+la interfaz y no permite cambiar rutas ejecutables. Para configurar rutas
+manualmente, acepta `binario`, `modelo` y `mmproj`. Vacío = autodetección.
 
 ---
 
@@ -267,17 +270,17 @@ cuantización. Vacío = autodetección.
 
 El servidor expone una API por si quieres automatizarlo:
 
-| Método | Ruta | Para qué |
-|---|---|---|
-| `GET` | `/api/estado` | binario, modelo, GPUs detectadas, configuración |
-| `GET` | `/api/modelo/catalogo` | cuantizaciones disponibles en Hugging Face |
-| `POST` | `/api/modelo/descargar` | inicia la descarga del modelo |
-| `GET` | `/api/modelo/progreso` | progreso de la descarga (SSE) |
-| `GET` `POST` `DELETE` | `/api/voces` | biblioteca de voces |
-| `POST` | `/api/generar` | lanza una síntesis, devuelve el id de tarea |
-| `GET` | `/api/tarea/{id}/eventos` | progreso y registro en vivo (SSE) |
-| `POST` | `/api/tarea/{id}/cancelar` | corta la generación |
-| `GET` `DELETE` | `/api/salidas` | historial de audios |
+| Método                | Ruta                       | Para qué                                        |
+| --------------------- | -------------------------- | ----------------------------------------------- |
+| `GET`                 | `/api/estado`              | binario, modelo, GPUs detectadas, configuración |
+| `GET`                 | `/api/modelo/catalogo`     | cuantizaciones disponibles en Hugging Face      |
+| `POST`                | `/api/modelo/descargar`    | inicia la descarga del modelo                   |
+| `GET`                 | `/api/modelo/progreso`     | progreso de la descarga (SSE)                   |
+| `GET` `POST` `DELETE` | `/api/voces`               | biblioteca de voces                             |
+| `POST`                | `/api/generar`             | lanza una síntesis, devuelve el id de tarea     |
+| `GET`                 | `/api/tarea/{id}/eventos`  | progreso y registro en vivo (SSE)               |
+| `POST`                | `/api/tarea/{id}/cancelar` | corta la generación                             |
+| `GET` `DELETE`        | `/api/salidas`             | historial de audios                             |
 
 ```bash
 curl -X POST http://127.0.0.1:8080/api/generar \

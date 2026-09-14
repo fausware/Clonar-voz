@@ -5,7 +5,11 @@ const api = async (url, opciones) => {
   const r = await fetch(url, opciones);
   if (!r.ok) {
     let msg = `HTTP ${r.status}`;
-    try { msg = (await r.json()).detail || msg; } catch { /* respuesta sin JSON */ }
+    try {
+      msg = (await r.json()).detail || msg;
+    } catch {
+      /* respuesta sin JSON */
+    }
     throw new Error(msg);
   }
   return r.status === 204 ? null : r.json();
@@ -19,8 +23,16 @@ const estado = {
   audioGrabado: null,
 };
 
-const CAMPOS_AJUSTES = ["temp", "top_p", "top_k", "semilla",
-                        "chars_por_bloque", "pausa_ms", "max_frames", "hilos"];
+const CAMPOS_AJUSTES = [
+  "temp",
+  "top_p",
+  "top_k",
+  "semilla",
+  "chars_por_bloque",
+  "pausa_ms",
+  "max_frames",
+  "hilos",
+];
 
 /* ======================= Estado del sistema ======================= */
 function pastilla(punto, etiqueta, valor, titulo = "") {
@@ -34,34 +46,53 @@ async function cargarEstado() {
   estado.sistema = s;
 
   const modelo = s.modelo ? s.modelo.split(/[\\/]/).pop() : "no encontrado";
-  const gpus = s.dispositivos.filter((d) => !d.id.toLowerCase().startsWith("cpu"));
+  const gpus = s.dispositivos.filter(
+    (d) => !d.id.toLowerCase().startsWith("cpu"),
+  );
 
   $("pastillas").innerHTML = [
-    pastilla(s.binario_ok && s.soporta_qwen3tts ? "ok" : "mal", "llama.cpp",
-             s.version || "no encontrado", s.binario),
-    pastilla(s.modelo_ok && s.mmproj_ok ? "ok" : "mal", "Modelo",
-             s.modelo_ok ? modelo : "falta", s.modelo),
-    pastilla(gpus.length ? "ok" : "medio", "Cómputo",
-             gpus.length ? `${gpus.length} GPU · CPU` : "solo CPU",
-             gpus.map((g) => `${g.id}: ${g.nombre}`).join("\n")),
+    pastilla(
+      s.binario_ok && s.soporta_qwen3tts ? "ok" : "mal",
+      "llama.cpp",
+      s.version || "no encontrado",
+      s.binario,
+    ),
+    pastilla(
+      s.modelo_ok && s.mmproj_ok ? "ok" : "mal",
+      "Modelo",
+      s.modelo_ok ? modelo : "falta",
+      s.modelo,
+    ),
+    pastilla(
+      gpus.length ? "ok" : "medio",
+      "Cómputo",
+      gpus.length ? `${gpus.length} GPU · CPU` : "solo CPU",
+      gpus.map((g) => `${g.id}: ${g.nombre}`).join("\n"),
+    ),
     pastilla(s.ffmpeg ? "ok" : "medio", "ffmpeg", s.ffmpeg ? "sí" : "no"),
   ].join("");
 
   const problemas = [];
   if (!s.binario_ok) {
-    problemas.push("No se encuentra <code>llama-tts</code>. Instálalo con " +
-                   "<code>winget install ggml.llamacpp</code> o indica su ruta en config.json.");
+    problemas.push(
+      "No se encuentra <code>llama-tts</code>. Instálalo con " +
+        "<code>winget install ggml.llamacpp</code> o indica su ruta en config.json.",
+    );
   } else if (!s.soporta_qwen3tts) {
-    problemas.push("Tu build de llama.cpp es anterior al soporte de Qwen3-TTS. " +
-                   "Actualiza con <code>winget upgrade ggml.llamacpp</code>.");
+    problemas.push(
+      "Tu build de llama.cpp es anterior al soporte de Qwen3-TTS. " +
+        "Actualiza con <code>winget upgrade ggml.llamacpp</code>.",
+    );
   }
   // Si falta el modelo, el panel de descarga ya lo explica: no duplicamos el aviso.
   const faltaModelo = !s.modelo_ok || !s.mmproj_ok;
   $("panel-modelo").classList.toggle("oculto", !faltaModelo);
   if (faltaModelo) await cargarCatalogoModelo();
   if (!s.ffmpeg) {
-    problemas.push("Sin <code>ffmpeg</code> solo podrás subir referencias en wav o mp3, " +
-                   "y la grabación desde el navegador no funcionará.");
+    problemas.push(
+      "Sin <code>ffmpeg</code> solo podrás subir WAV PCM mono a 16 kHz, " +
+        "y la grabación desde el navegador no funcionará.",
+    );
   }
 
   const aviso = $("aviso");
@@ -70,11 +101,14 @@ async function cargarEstado() {
 
   // Idiomas
   $("idioma").innerHTML = Object.entries(s.idiomas)
-    .map(([cod, nom]) => `<option value="${cod}">${nom}</option>`).join("");
+    .map(([cod, nom]) => `<option value="${cod}">${nom}</option>`)
+    .join("");
   $("idioma").value = s.config.idioma;
 
   // Dispositivos
-  const opciones = [`<option value="auto">Automático (mejor disponible)</option>`];
+  const opciones = [
+    `<option value="auto">Automático (mejor disponible)</option>`,
+  ];
   for (const d of s.dispositivos) {
     const marca = d.id === s.dispositivo_preferido ? " ★" : "";
     opciones.push(`<option value="${d.id}">GPU · ${d.nombre}${marca}</option>`);
@@ -85,7 +119,8 @@ async function cargarEstado() {
 
   // Ajustes avanzados
   for (const campo of CAMPOS_AJUSTES) {
-    if ($(campo) && s.config[campo] !== undefined) $(campo).value = s.config[campo];
+    if ($(campo) && s.config[campo] !== undefined)
+      $(campo).value = s.config[campo];
   }
   actualizarEtiquetasRango();
 }
@@ -95,10 +130,13 @@ async function cargarCatalogoModelo() {
   const c = await api("/api/modelo/catalogo");
   $("enlace-hf").href = c.url;
 
-  const opciones = (grupo, pordefecto) => Object.entries(c.catalogo[grupo])
-    .map(([clave, i]) =>
-      `<option value="${clave}" ${clave === pordefecto ? "selected" : ""}>${i.etiqueta}</option>`)
-    .join("");
+  const opciones = (grupo, pordefecto) =>
+    Object.entries(c.catalogo[grupo])
+      .map(
+        ([clave, i]) =>
+          `<option value="${clave}" ${clave === pordefecto ? "selected" : ""}>${i.etiqueta}</option>`,
+      )
+      .join("");
 
   $("quant-modelo").innerHTML = opciones("modelo", c.por_defecto.modelo);
   $("quant-mmproj").innerHTML = opciones("mmproj", c.por_defecto.mmproj);
@@ -106,7 +144,9 @@ async function cargarCatalogoModelo() {
 
 function descargaEnCurso(activa) {
   $("btn-descargar-modelo").disabled = activa;
-  $("btn-descargar-modelo").textContent = activa ? "Descargando…" : "Descargar ahora";
+  $("btn-descargar-modelo").textContent = activa
+    ? "Descargando…"
+    : "Descargar ahora";
   $("btn-cancelar-descarga").classList.toggle("oculto", !activa);
   $("quant-modelo").disabled = activa;
   $("quant-mmproj").disabled = activa;
@@ -122,7 +162,10 @@ async function descargarModelo() {
     await api("/api/modelo/descargar", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ modelo: $("quant-modelo").value, mmproj: $("quant-mmproj").value }),
+      body: JSON.stringify({
+        modelo: $("quant-modelo").value,
+        mmproj: $("quant-mmproj").value,
+      }),
     });
   } catch (err) {
     descargaEnCurso(false);
@@ -140,7 +183,9 @@ async function descargarModelo() {
       const restante = d.velocidad > 0 ? (d.total - d.hecho) / d.velocidad : 0;
       $("texto-modelo").textContent =
         `${d.archivo} · ${pct.toFixed(1)}% · ${tamano(d.hecho)} de ${tamano(d.total)}` +
-        (d.velocidad ? ` · ${tamano(d.velocidad)}/s · faltan ${reloj(restante)}` : "");
+        (d.velocidad
+          ? ` · ${tamano(d.velocidad)}/s · faltan ${reloj(restante)}`
+          : "");
     }
 
     if (!d.activa) {
@@ -156,7 +201,10 @@ async function descargarModelo() {
     }
   };
 
-  fuente.onerror = () => { fuente.close(); descargaEnCurso(false); };
+  fuente.onerror = () => {
+    fuente.close();
+    descargaEnCurso(false);
+  };
 }
 
 /* ======================= Voces ======================= */
@@ -170,7 +218,9 @@ async function cargarVoces() {
     return;
   }
 
-  cont.innerHTML = voces.map((v) => `
+  cont.innerHTML = voces
+    .map(
+      (v) => `
     <div class="voz ${estado.vozSeleccionada === v.id ? "sel" : ""}" data-id="${v.id}">
       <div class="voz-datos">
         <div class="voz-nombre">${escapar(v.nombre)}</div>
@@ -178,7 +228,9 @@ async function cargarVoces() {
       </div>
       <button class="icono-btn escuchar" data-id="${v.id}" title="Escuchar">▶</button>
       <button class="icono-btn borrar" data-id="${v.id}" title="Eliminar">✕</button>
-    </div>`).join("");
+    </div>`,
+    )
+    .join("");
 
   cont.querySelectorAll(".voz").forEach((el) => {
     el.addEventListener("click", (ev) => {
@@ -190,14 +242,17 @@ async function cargarVoces() {
   });
 
   cont.querySelectorAll(".escuchar").forEach((b) => {
-    b.addEventListener("click", () => new Audio(`/api/voces/${b.dataset.id}/audio`).play());
+    b.addEventListener("click", () =>
+      new Audio(`/api/voces/${b.dataset.id}/audio`).play(),
+    );
   });
 
   cont.querySelectorAll(".borrar").forEach((b) => {
     b.addEventListener("click", async () => {
       if (!confirm("¿Eliminar esta voz de la biblioteca?")) return;
       await api(`/api/voces/${b.dataset.id}`, { method: "DELETE" });
-      if (estado.vozSeleccionada === b.dataset.id) estado.vozSeleccionada = null;
+      if (estado.vozSeleccionada === b.dataset.id)
+        estado.vozSeleccionada = null;
       cargarVoces();
     });
   });
@@ -215,7 +270,11 @@ async function subirVoz(archivo, nombre, transcripcion) {
 }
 
 /* ======================= Grabación ======================= */
-let grabador = null, trozos = [], tempo = null, animacion = null, contextoAudio = null;
+let grabador = null,
+  trozos = [],
+  tempo = null,
+  animacion = null,
+  contextoAudio = null;
 
 async function alternarGrabacion() {
   const boton = $("btn-grabar");
@@ -228,10 +287,16 @@ async function alternarGrabacion() {
   let flujo;
   try {
     flujo = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+      },
     });
   } catch {
-    alert("No se pudo acceder al micrófono. Revisa los permisos del navegador.");
+    alert(
+      "No se pudo acceder al micrófono. Revisa los permisos del navegador.",
+    );
     return;
   }
 
@@ -242,9 +307,14 @@ async function alternarGrabacion() {
     flujo.getTracks().forEach((t) => t.stop());
     cancelAnimationFrame(animacion);
     clearInterval(tempo);
-    if (contextoAudio) { contextoAudio.close(); contextoAudio = null; }
+    if (contextoAudio) {
+      contextoAudio.close();
+      contextoAudio = null;
+    }
 
-    estado.audioGrabado = new Blob(trozos, { type: grabador.mimeType || "audio/webm" });
+    estado.audioGrabado = new Blob(trozos, {
+      type: grabador.mimeType || "audio/webm",
+    });
     const previo = $("previo-grabacion");
     previo.src = URL.createObjectURL(estado.audioGrabado);
     previo.classList.remove("oculto");
@@ -261,7 +331,8 @@ async function alternarGrabacion() {
 
   const inicio = Date.now();
   tempo = setInterval(() => {
-    $("cronometro").textContent = ((Date.now() - inicio) / 1000).toFixed(1) + " s";
+    $("cronometro").textContent =
+      ((Date.now() - inicio) / 1000).toFixed(1) + " s";
   }, 100);
 
   dibujarVumetro(flujo);
@@ -318,7 +389,10 @@ function ajustesActuales() {
 /* ======================= Generación ======================= */
 async function generar() {
   const texto = $("texto").value.trim();
-  if (!texto) { alert("Escribe el texto que quieres sintetizar."); return; }
+  if (!texto) {
+    alert("Escribe el texto que quieres sintetizar.");
+    return;
+  }
 
   const boton = $("btn-generar");
   boton.disabled = true;
@@ -363,13 +437,12 @@ async function generar() {
       const consola = $("consola");
       consola.textContent += dato.linea + "\n";
       consola.scrollTop = consola.scrollHeight;
-
     } else if (dato.tipo === "bloque") {
       bloqueActual = dato.indice;
-      $("barra-relleno").style.width = `${((dato.indice - 1) / dato.total) * 100}%`;
+      $("barra-relleno").style.width =
+        `${((dato.indice - 1) / dato.total) * 100}%`;
       $("texto-progreso").textContent =
         `Bloque ${dato.indice} de ${dato.total} · ${recortar(dato.texto, 70)}`;
-
     } else if (dato.tipo === "fin") {
       $("barra-relleno").style.width = "100%";
       $("texto-progreso").textContent =
@@ -381,15 +454,17 @@ async function generar() {
       $("info-resultado").textContent =
         `${dato.archivo} · ${dato.duracion} s · generado en ${dato.segundos} s`;
       $("resultado").classList.remove("oculto");
-      $("reproductor").play().catch(() => { /* autoplay bloqueado */ });
+      $("reproductor")
+        .play()
+        .catch(() => {
+          /* autoplay bloqueado */
+        });
       cerrarFlujo();
       cargarHistorial();
-
     } else if (dato.tipo === "error") {
       $("texto-progreso").textContent = "✕ Error: " + dato.mensaje;
       $("caja-consola").open = true;
       cerrarFlujo();
-
     } else if (dato.tipo === "cancelada") {
       $("texto-progreso").textContent = "Generación cancelada.";
       cerrarFlujo();
@@ -431,7 +506,9 @@ async function cargarHistorial() {
     return;
   }
 
-  cont.innerHTML = salidas.map((s) => `
+  cont.innerHTML = salidas
+    .map(
+      (s) => `
     <div class="item-historial">
       <audio controls preload="none" src="/api/salidas/${s.archivo}"></audio>
       <div class="item-cabecera">
@@ -441,7 +518,9 @@ async function cargarHistorial() {
           <button class="icono-btn borrar" data-archivo="${s.archivo}" title="Eliminar">✕</button>
         </span>
       </div>
-    </div>`).join("");
+    </div>`,
+    )
+    .join("");
 
   cont.querySelectorAll(".borrar").forEach((b) => {
     b.addEventListener("click", async () => {
@@ -452,20 +531,27 @@ async function cargarHistorial() {
 }
 
 /* ======================= Utilidades ======================= */
-const escapar = (t) => String(t).replace(/[&<>"]/g,
-  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const escapar = (t) =>
+  String(t).replace(
+    /[&<>"]/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c],
+  );
 const recortar = (t, n) => (t.length > n ? t.slice(0, n) + "…" : t);
 
 function tamano(n) {
   const u = ["B", "KB", "MB", "GB"];
   let i = 0;
-  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  while (n >= 1024 && i < u.length - 1) {
+    n /= 1024;
+    i++;
+  }
   return `${i === 0 ? Math.round(n) : n.toFixed(1)} ${u[i]}`;
 }
 
 function reloj(segundos) {
   if (!isFinite(segundos) || segundos <= 0) return "—";
-  const m = Math.floor(segundos / 60), s = Math.round(segundos % 60);
+  const m = Math.floor(segundos / 60),
+    s = Math.round(segundos % 60);
   return m ? `${m} min ${s.toString().padStart(2, "0")} s` : `${s} s`;
 }
 
@@ -474,8 +560,12 @@ function conectarEventos() {
   // Pestañas
   document.querySelectorAll(".pestana").forEach((p) => {
     p.addEventListener("click", () => {
-      document.querySelectorAll(".pestana").forEach((o) => o.classList.remove("activa"));
-      document.querySelectorAll(".panel").forEach((o) => o.classList.add("oculto"));
+      document
+        .querySelectorAll(".pestana")
+        .forEach((o) => o.classList.remove("activa"));
+      document
+        .querySelectorAll(".panel")
+        .forEach((o) => o.classList.add("oculto"));
       p.classList.add("activa");
       $(p.dataset.panel).classList.remove("oculto");
     });
@@ -485,13 +575,19 @@ function conectarEventos() {
   $("btn-grabar").addEventListener("click", alternarGrabacion);
   $("btn-guardar-grabacion").addEventListener("click", async () => {
     const nombre = $("nombre-grabacion").value.trim();
-    if (!nombre) { alert("Ponle un nombre a la voz."); return; }
+    if (!nombre) {
+      alert("Ponle un nombre a la voz.");
+      return;
+    }
     if (!estado.audioGrabado) return;
     const boton = $("btn-guardar-grabacion");
     boton.disabled = true;
     try {
-      await subirVoz(new File([estado.audioGrabado], "grabacion.webm"),
-                     nombre, $("trans-grabacion").value);
+      await subirVoz(
+        new File([estado.audioGrabado], "grabacion.webm"),
+        nombre,
+        $("trans-grabacion").value,
+      );
       $("guardar-grabacion").classList.add("oculto");
       $("previo-grabacion").classList.add("oculto");
       $("nombre-grabacion").value = $("trans-grabacion").value = "";
@@ -505,13 +601,17 @@ function conectarEventos() {
   });
 
   // Subida de archivo
-  const zona = $("zona-archivo"), entrada = $("archivo-voz");
+  const zona = $("zona-archivo"),
+    entrada = $("archivo-voz");
   entrada.addEventListener("change", () => {
     if (!entrada.files.length) return;
     $("texto-archivo").textContent = entrada.files[0].name;
     $("btn-subir-voz").disabled = false;
     if (!$("nombre-archivo-voz").value) {
-      $("nombre-archivo-voz").value = entrada.files[0].name.replace(/\.[^.]+$/, "");
+      $("nombre-archivo-voz").value = entrada.files[0].name.replace(
+        /\.[^.]+$/,
+        "",
+      );
     }
   });
 
@@ -528,14 +628,18 @@ function conectarEventos() {
 
   $("btn-subir-voz").addEventListener("click", async () => {
     const nombre = $("nombre-archivo-voz").value.trim();
-    if (!nombre) { alert("Ponle un nombre a la voz."); return; }
+    if (!nombre) {
+      alert("Ponle un nombre a la voz.");
+      return;
+    }
     const boton = $("btn-subir-voz");
     boton.disabled = true;
     boton.textContent = "Procesando…";
     try {
       await subirVoz(entrada.files[0], nombre, $("trans-archivo-voz").value);
       entrada.value = "";
-      $("texto-archivo").textContent = "Arrastra un audio aquí o haz clic para elegirlo";
+      $("texto-archivo").textContent =
+        "Arrastra un audio aquí o haz clic para elegirlo";
       $("nombre-archivo-voz").value = $("trans-archivo-voz").value = "";
       document.querySelector('[data-panel="p-biblioteca"]').click();
     } catch (err) {
@@ -568,7 +672,9 @@ function conectarEventos() {
     });
     const boton = $("btn-guardar-ajustes");
     boton.textContent = "✓ Guardado";
-    setTimeout(() => { boton.textContent = "Guardar como predeterminados"; }, 1800);
+    setTimeout(() => {
+      boton.textContent = "Guardar como predeterminados";
+    }, 1800);
   });
 
   // Descarga del modelo
@@ -581,7 +687,9 @@ function conectarEventos() {
   $("btn-generar").addEventListener("click", generar);
   $("btn-cancelar").addEventListener("click", async () => {
     if (estado.tareaActual) {
-      await api(`/api/tarea/${estado.tareaActual}/cancelar`, { method: "POST" });
+      await api(`/api/tarea/${estado.tareaActual}/cancelar`, {
+        method: "POST",
+      });
     }
   });
 
@@ -598,7 +706,8 @@ function conectarEventos() {
     await cargarEstado();
   } catch (err) {
     $("aviso").classList.remove("oculto");
-    $("aviso").textContent = "No se pudo contactar con el servidor: " + err.message;
+    $("aviso").textContent =
+      "No se pudo contactar con el servidor: " + err.message;
   }
   await cargarVoces();
   await cargarHistorial();
